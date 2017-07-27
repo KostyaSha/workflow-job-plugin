@@ -1,7 +1,7 @@
 /*
  * The MIT License
  *
- * Copyright 2015 CloudBees, Inc.
+ * Copyright (c) 2016, CloudBees, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -21,32 +21,33 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+package org.jenkinsci.plugins.workflow.job.properties;
 
-package org.jenkinsci.plugins.workflow.job;
-
-import hudson.model.JobProperty;
-import hudson.security.ACL;
-import javax.annotation.CheckForNull;
-import javax.annotation.Nonnull;
+import hudson.Extension;
+import jenkins.model.OptionalJobProperty;
+import org.jenkinsci.Symbol;
+import org.jenkinsci.plugins.workflow.job.WorkflowJob;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.export.ExportedBean;
 
 /**
- * Job property which can specially affect behavior of the project.
+ * {@link OptionalJobProperty} for setting whether a job should allow concurrent builds.
  */
-public abstract class WorkflowJobProperty extends JobProperty<WorkflowJob> {
+@ExportedBean
+public class DisableConcurrentBuildsJobProperty extends OptionalJobProperty<WorkflowJob> {
 
-    /**
-     * Allows a property to control permissions related to the job.
-     */
-    public @Nonnull ACL decorateACL(@Nonnull ACL acl) {
-        return acl;
+    @DataBoundConstructor
+    public DisableConcurrentBuildsJobProperty() {
     }
 
-    /**
-     * Allows a property to control whether {@link WorkflowJob#isBuildable}.
-     * @return a value, or null to have no effect
-     */
-    public @CheckForNull Boolean isBuildable() {
-        return null;
+    @Extension
+    @Symbol("disableConcurrentBuilds")
+    public static class DescriptorImpl extends OptionalJobPropertyDescriptor {
+
+        @Override public String getDisplayName() {
+            return "Do not allow concurrent builds";
+        }
+
     }
 
 }

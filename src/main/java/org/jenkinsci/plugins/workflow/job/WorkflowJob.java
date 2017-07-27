@@ -24,20 +24,24 @@
 
 package org.jenkinsci.plugins.workflow.job;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.AbortException;
+import hudson.BulkChange;
 import hudson.Extension;
 import hudson.ExtensionList;
 import hudson.FilePath;
+import hudson.Functions;
 import hudson.Launcher;
 import hudson.init.InitMilestone;
 import hudson.init.Initializer;
 import hudson.model.Action;
+import hudson.model.BallColor;
+import hudson.model.BuildAuthorizationToken;
 import hudson.model.BuildableItem;
 import hudson.model.Cause;
 import hudson.model.Computer;
 import hudson.model.Descriptor;
 import hudson.model.DescriptorVisibilityFilter;
-import hudson.model.Executor;
 import hudson.model.Item;
 import hudson.model.ItemGroup;
 import hudson.model.Items;
@@ -52,6 +56,7 @@ import hudson.model.RunMap;
 import hudson.model.TaskListener;
 import hudson.model.TopLevelItem;
 import hudson.model.TopLevelItemDescriptor;
+import hudson.model.listeners.ItemListener;
 import hudson.model.listeners.SCMListener;
 import hudson.model.queue.CauseOfBlockage;
 import hudson.model.queue.QueueTaskFuture;
@@ -73,13 +78,16 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import javax.annotation.CheckForNull;
 import javax.servlet.ServletException;
+import jenkins.model.BlockedBecauseOfBuildInProgress;
+
 import jenkins.model.Jenkins;
 import jenkins.model.ParameterizedJobMixIn;
 import jenkins.model.lazy.LazyBuildMixIn;
@@ -89,8 +97,13 @@ import net.sf.json.JSONObject;
 import org.acegisecurity.Authentication;
 import org.jenkinsci.plugins.workflow.flow.FlowDefinition;
 import org.jenkinsci.plugins.workflow.flow.FlowDefinitionDescriptor;
+import org.jenkinsci.plugins.workflow.job.properties.DisableConcurrentBuildsJobProperty;
+import org.jenkinsci.plugins.workflow.job.properties.PipelineTriggersJobProperty;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.DoNotUse;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.stapler.HttpRedirect;
+import org.kohsuke.stapler.HttpResponse;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerResponse;
@@ -100,19 +113,23 @@ import org.kohsuke.stapler.interceptor.RequirePOST;
 @SuppressWarnings({"unchecked", "rawtypes"})
 public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements BuildableItem, LazyBuildMixIn.LazyLoadingJob<WorkflowJob,WorkflowRun>, ParameterizedJobMixIn.ParameterizedJob, TopLevelItem, Queue.FlyweightTask, SCMTriggerItem {
 
+    private static final Logger LOGGER = Logger.getLogger(WorkflowJob.class.getName());
+
     private FlowDefinition definition;
-    private DescribableList<Trigger<?>,TriggerDescriptor> triggers = new DescribableList<Trigger<?>,TriggerDescriptor>(this);
+    /** @deprecated - use {@link PipelineTriggersJobProperty} */
+    private DescribableList<Trigger<?>,TriggerDescriptor> triggers = new DescribableList<>(this);
     private volatile Integer quietPeriod;
     @SuppressWarnings("deprecation")
     private hudson.model.BuildAuthorizationToken authToken;
     private transient LazyBuildMixIn<WorkflowJob,WorkflowRun> buildMixIn;
-    /** defaults to true */
+    /** @deprecated replaced by {@link DisableConcurrentBuildsJobProperty} */
     private @CheckForNull Boolean concurrentBuild;
     /**
      * Map from {@link SCM#getKey} to last version we encountered during polling.
      * TODO is it important to persist this? {@link hudson.model.AbstractProject#pollingBaseline} is not persisted.
      */
     private transient volatile Map<String,SCMRevisionState> pollingBaselines;
+    private volatile boolean disabled;
 
     public WorkflowJob(ItemGroup parent, String name) {
         super(parent, name);
@@ -126,18 +143,20 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
 
     @Override public void onLoad(ItemGroup<? extends Item> parent, String name) throws IOException {
         super.onLoad(parent, name);
+
         if (buildMixIn == null) {
             buildMixIn = createBuildMixIn();
         }
         buildMixIn.onLoad(parent, name);
-        if (triggers == null) {
-            triggers = new DescribableList<Trigger<?>,TriggerDescriptor>(this);
-        } else {
-            triggers.setOwner(this);
+        if (triggers != null && !triggers.isEmpty()) {
+            setTriggers(triggers.toList());
         }
-        for (Trigger t : triggers) {
-            t.start(this, Items.currentlyUpdatingByXml());
+        if (concurrentBuild != null) {
+            setConcurrentBuild(concurrentBuild);
         }
+
+        getTriggersJobProperty().stopTriggers();
+        getTriggersJobProperty().startTriggers(Items.currentlyUpdatingByXml());
     }
 
     private LazyBuildMixIn<WorkflowJob,WorkflowRun> createBuildMixIn() {
@@ -165,6 +184,11 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
 
     public void setDefinition(FlowDefinition definition) {
         this.definition = definition;
+        try {
+            save();
+        } catch (IOException x) {
+            LOGGER.log(Level.WARNING, "could not save " + this, x);
+        }
     }
 
     @SuppressWarnings("deprecation")
@@ -173,23 +197,34 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
         JSONObject json = req.getSubmittedForm();
         definition = req.bindJSON(FlowDefinition.class, json.getJSONObject("definition"));
         authToken = hudson.model.BuildAuthorizationToken.create(req);
-        for (Trigger t : triggers) {
-            t.stop();
-        }
+
         if (req.getParameter("hasCustomQuietPeriod") != null) {
             quietPeriod = Integer.parseInt(req.getParameter("quiet_period"));
         } else {
             quietPeriod = null;
         }
-        triggers.rebuild(req, json, Trigger.for_(this));
-        for (Trigger t : triggers) {
-            t.start(this, true);
-        }
-        concurrentBuild = json.optBoolean("concurrentBuild") ? null : false;
+
+        makeDisabled(json.optBoolean("disable"));
     }
-    
+
+
+    @Override public void addProperty(JobProperty jobProp) throws IOException {
+        super.addProperty(jobProp);
+        getTriggersJobProperty().stopTriggers();
+        getTriggersJobProperty().startTriggers(Items.currentlyUpdatingByXml());
+    }
+
     @Override public boolean isBuildable() {
-        return true; // why not?
+        for (JobProperty<?> property : properties) {
+            if (property instanceof WorkflowJobProperty) {
+                Boolean buildable = ((WorkflowJobProperty) property).isBuildable();
+                if (buildable != null) {
+                    return buildable;
+                }
+            }
+        }
+        // TODO https://github.com/jenkinsci/jenkins/pull/2866: return ParameterizedJobMixIn.ParameterizedJob.super.isBuildable();
+        return !isDisabled() && !isHoldOffBuildUntilSave();
     }
 
     @Override protected RunMap<WorkflowRun> _getRuns() {
@@ -232,7 +267,11 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
         return buildMixIn.createHistoryWidget();
     }
 
+    // TODO https://github.com/jenkinsci/jenkins/pull/2866 remove override
     @Override public Queue.Executable createExecutable() throws IOException {
+        if (isDisabled()) {
+            return null;
+        }
         return buildMixIn.newBuild();
     }
 
@@ -278,6 +317,62 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
         return createParameterizedJobMixIn().isParameterized();
     }
 
+    // TODO https://github.com/jenkinsci/jenkins/pull/2866 @Override
+    public boolean isDisabled() {
+        return disabled;
+    }
+
+    @Restricted(DoNotUse.class)
+    // TODO https://github.com/jenkinsci/jenkins/pull/2866 @Override
+    public void setDisabled(boolean disabled) {
+        this.disabled = disabled;
+    }
+
+    // TODO https://github.com/jenkinsci/jenkins/pull/2866 @Override
+    public boolean supportsMakeDisabled() {
+        return true;
+    }
+
+    // TODO https://github.com/jenkinsci/jenkins/pull/2866 remove override
+    public void makeDisabled(boolean b) throws IOException {
+        if (isDisabled() == b) {
+            return; // noop
+        }
+        if (b && !supportsMakeDisabled()) {
+            return; // do nothing if the disabling is unsupported
+        }
+        setDisabled(b);
+        if (b) {
+            Jenkins.getActiveInstance().getQueue().cancel(this);
+        }
+        save();
+        ItemListener.fireOnUpdated(this);
+    }
+
+    // TODO https://github.com/jenkinsci/jenkins/pull/2866 remove override
+    @RequirePOST
+    public HttpResponse doDisable() throws IOException, ServletException {
+        checkPermission(CONFIGURE);
+        makeDisabled(true);
+        return new HttpRedirect(".");
+    }
+
+    // TODO https://github.com/jenkinsci/jenkins/pull/2866 remove override
+    @RequirePOST
+    public HttpResponse doEnable() throws IOException, ServletException {
+        checkPermission(CONFIGURE);
+        makeDisabled(false);
+        return new HttpRedirect(".");
+    }
+
+    @Override public BallColor getIconColor() {
+        if (isDisabled()) {
+            return isBuilding() ? BallColor.DISABLED_ANIME : BallColor.DISABLED;
+        } else {
+            return super.getIconColor();
+        }
+    }
+
     @SuppressWarnings("deprecation")
     @Override public hudson.model.BuildAuthorizationToken getAuthToken() {
         return authToken;
@@ -313,38 +408,39 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
 
     @Override public CauseOfBlockage getCauseOfBlockage() {
         if (isLogUpdated() && !isConcurrentBuild()) {
-            return new BecauseOfBuildInProgress(getLastBuild());
+            WorkflowRun lastBuild = getLastBuild();
+            if (lastBuild != null) {
+                return new BlockedBecauseOfBuildInProgress(lastBuild);
+            } // else race condition, cf. AbstractProject
         }
         return null;
-    }
-    // TODO use BlockedBecauseOfBuildInProgress in 1.624 (and remove Messages.properties in resources)
-    public static class BecauseOfBuildInProgress extends CauseOfBlockage {
-        private final Run<?,?> build;
-
-        public BecauseOfBuildInProgress(Run<?, ?> build) {
-            this.build = build;
-        }
-
-        @Override
-        public String getShortDescription() {
-            Executor e = build.getExecutor();
-            String eta = "";
-            if (e != null) {
-                eta = Messages.BlockedBecauseOfBuildInProgress_ETA(e.getEstimatedRemainingTime());
-            }
-            int lbn = build.getNumber();
-            return Messages.BlockedBecauseOfBuildInProgress_shortDescription(lbn, eta);
-        }
     }
 
     @Exported
     @Override public boolean isConcurrentBuild() {
-        return !Boolean.FALSE.equals(concurrentBuild);
+        return getProperty(DisableConcurrentBuildsJobProperty.class) == null;
     }
-    
+
     public void setConcurrentBuild(boolean b) throws IOException {
-        concurrentBuild = b ? null : false;
-        save();
+        concurrentBuild = null;
+
+        boolean propertyExists = getProperty(DisableConcurrentBuildsJobProperty.class) != null;
+
+        // If the property exists, concurrent builds are disabled. So if the argument here is true and the
+        // property exists, we need to remove the property, while if the argument is false and the property
+        // does not exist, we need to add the property. Yay for flipping boolean values around!
+        if (propertyExists == b) {
+            BulkChange bc = new BulkChange(this);
+            try {
+                removeProperty(DisableConcurrentBuildsJobProperty.class);
+                if (!b) {
+                    addProperty(new DisableConcurrentBuildsJobProperty());
+                }
+                bc.commit();
+            } finally {
+                bc.abort();
+            }
+        }
     }
 
     @Override public ACL getACL() {
@@ -367,7 +463,7 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
 
     @Override public Collection<? extends SubTask> getSubTasks() {
         // TODO mostly copied from AbstractProject, except SubTaskContributor is not available:
-        List<SubTask> subTasks = new ArrayList<SubTask>();
+        List<SubTask> subTasks = new ArrayList<>();
         subTasks.add(this);
         for (JobProperty<? super WorkflowJob> p : properties) {
             subTasks.addAll(p.getSubTasks());
@@ -383,6 +479,7 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
         return getDefaultAuthentication();
     }
 
+    @SuppressFBWarnings(value="RCN_REDUNDANT_NULLCHECK_OF_NONNULL_VALUE", justification="TODO 1.653+ switch to Jenkins.getInstanceOrNull")
     @Override public Label getAssignedLabel() {
         Jenkins j = Jenkins.getInstance();
         if (j == null) {
@@ -416,26 +513,74 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
     }
 
     @Override public Map<TriggerDescriptor, Trigger<?>> getTriggers() {
-        return triggers.toMap();
+        return getTriggersJobProperty().getTriggersMap();
     }
 
-    public void addTrigger(Trigger trigger) {
-        Trigger old = triggers.get(trigger.getDescriptor());
-        if (old != null) {
-            old.stop();
-            triggers.remove(old);
+    public PipelineTriggersJobProperty getTriggersJobProperty() {
+        PipelineTriggersJobProperty triggerProp = getProperty(PipelineTriggersJobProperty.class);
+
+        if (triggerProp == null) {
+            triggerProp = new PipelineTriggersJobProperty(new ArrayList<Trigger>());
         }
-        triggers.add(trigger);
-        trigger.start(this, true);
+
+        return triggerProp;
     }
 
-    @SuppressWarnings("deprecation")
-    @Override public List<Action> getActions() {
-        List<Action> actions = new ArrayList<Action>(super.getActions());
-        for (Trigger<?> trigger : triggers) {
-            actions.addAll(trigger.getProjectActions());
+    @Restricted(NoExternalUse.class)
+    public void addTriggersJobPropertyWithoutStart(PipelineTriggersJobProperty prop) throws IOException {
+        super.addProperty(prop);
+    }
+
+    public void setTriggers(List<Trigger<?>> inputTriggers) throws IOException {
+        triggers = null;
+        BulkChange bc = new BulkChange(this);
+        try {
+            PipelineTriggersJobProperty originalProp = getTriggersJobProperty();
+
+            removeProperty(PipelineTriggersJobProperty.class);
+
+            PipelineTriggersJobProperty triggerProp = new PipelineTriggersJobProperty(null);
+            triggerProp.setTriggers(inputTriggers);
+
+            addProperty(triggerProp);
+            bc.commit();
+
+            originalProp.stopTriggers();
+
+            // No longer need to start triggers here - that's done by when we add the property.
+        } finally {
+            bc.abort();
         }
-        return actions;
+    }
+
+    public void addTrigger(Trigger trigger) throws IOException {
+        BulkChange bc = new BulkChange(this);
+        try {
+            PipelineTriggersJobProperty originalProp = getTriggersJobProperty();
+            Trigger old = originalProp.getTriggerForDescriptor(trigger.getDescriptor());
+            if (old != null) {
+                originalProp.removeTrigger(old);
+                old.stop();
+            }
+
+            originalProp.addTrigger(trigger);
+            removeProperty(PipelineTriggersJobProperty.class);
+
+            addProperty(originalProp);
+            bc.commit();
+        } finally {
+            bc.abort();
+        }
+    }
+
+    @Override
+    public void removeProperty(JobProperty jobProperty) throws IOException {
+        // Need to make sure we stop any triggers.
+        if (jobProperty instanceof PipelineTriggersJobProperty) {
+            ((PipelineTriggersJobProperty)jobProperty).stopTriggers();
+        }
+
+        super.removeProperty(jobProperty);
     }
 
     @Override
@@ -446,7 +591,7 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
     @Override
     public void replaceAction(Action a) {
         // CopyOnWriteArrayList does not support Iterator.remove, so need to do it this way:
-        List<Action> old = new ArrayList<Action>(1);
+        List<Action> old = new ArrayList<>(1);
         List<Action> current = super.getActions();
         for (Action a2 : current) {
             if (a2.getClass() == a.getClass()) {
@@ -462,15 +607,24 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
     }
 
     @Override public SCMTrigger getSCMTrigger() {
-        return triggers.get(SCMTrigger.class);
+        for (Trigger t : getTriggersJobProperty().getTriggers()) {
+            if (t instanceof SCMTrigger) {
+                return (SCMTrigger) t;
+            }
+        }
+
+        return null;
     }
 
     @Override public Collection<? extends SCM> getSCMs() {
-        WorkflowRun b = getLastCompletedBuild();
+        WorkflowRun b = getLastSuccessfulBuild();
+        if (b == null) {
+            b = getLastCompletedBuild();
+        }
         if (b == null) {
             return Collections.emptySet();
         }
-        Map<String,SCM> scms = new LinkedHashMap<String,SCM>();
+        Map<String,SCM> scms = new LinkedHashMap<>();
         for (WorkflowRun.SCMCheckout co : b.checkouts(null)) {
             scms.put(co.scm.getKey(), co.scm);
         }
@@ -489,7 +643,34 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
         return typical;
     }
 
+    // TODO https://github.com/jenkinsci/jenkins/pull/2866 remove override
+    public boolean schedulePolling() {
+        if (isDisabled()) {
+            return false;
+        }
+        SCMTrigger scmt = getSCMTrigger();
+        if (scmt == null) {
+            return false;
+        }
+        scmt.run();
+        return true;
+    }
+
+    // TODO https://github.com/jenkinsci/jenkins/pull/2866 remove override
+    @SuppressWarnings("deprecation")
+    public void doPolling(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+        BuildAuthorizationToken.checkPermission((Job) this, getAuthToken(), req, rsp);
+        schedulePolling();
+        rsp.sendRedirect(".");
+    }
+
+    @SuppressFBWarnings(value="RCN_REDUNDANT_NULLCHECK_OF_NONNULL_VALUE", justification="TODO 1.653+ switch to Jenkins.getInstanceOrNull")
     @Override public PollingResult poll(TaskListener listener) {
+        if (!isBuildable()) {
+            listener.getLogger().println("Build disabled");
+            return PollingResult.NO_CHANGES;
+        }
+        // TODO 2.11+ call SCMDecisionHandler
         // TODO call SCMPollListener
         WorkflowRun lastBuild = getLastBuild();
         if (lastBuild == null) {
@@ -502,7 +683,7 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
             perhapsCompleteBuild = lastBuild;
         }
         if (pollingBaselines == null) {
-            pollingBaselines = new ConcurrentHashMap<String,SCMRevisionState>();
+            pollingBaselines = new ConcurrentHashMap<>();
         }
         PollingResult result = PollingResult.NO_CHANGES;
         for (WorkflowRun.SCMCheckout co : perhapsCompleteBuild.checkouts(listener)) {
@@ -559,7 +740,7 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
             } catch (AbortException x) {
                 listener.error("polling failed in " + co.workspace + " on " + co.node + ": " + x.getMessage());
             } catch (Exception x) {
-                x.printStackTrace(listener.error("polling failed in " + co.workspace + " on " + co.node));
+                listener.error("polling failed in " + co.workspace + " on " + co.node).println(Functions.printThrowable(x).trim()); // TODO 2.43+ use Functions.printStackTrace
             }
         }
         return result;
@@ -569,7 +750,7 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
             if (build instanceof WorkflowRun && pollingBaseline != null) {
                 WorkflowJob job = ((WorkflowRun) build).getParent();
                 if (job.pollingBaselines == null) {
-                    job.pollingBaselines = new ConcurrentHashMap<String,SCMRevisionState>();
+                    job.pollingBaselines = new ConcurrentHashMap<>();
                 }
                 job.pollingBaselines.put(scm.getKey(), pollingBaseline);
             }
@@ -577,8 +758,9 @@ public final class WorkflowJob extends Job<WorkflowJob,WorkflowRun> implements B
     }
 
     @Override protected void performDelete() throws IOException, InterruptedException {
-        super.performDelete();
+        makeDisabled(true);
         // TODO call SCM.processWorkspaceBeforeDeletion
+        super.performDelete();
     }
 
     @Initializer(before=InitMilestone.EXTENSIONS_AUGMENTED)

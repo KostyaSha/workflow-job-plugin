@@ -28,31 +28,40 @@ import com.google.common.base.Optional;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
+import com.google.common.collect.ImmutableSortedSet;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.AbortException;
+import hudson.EnvVars;
 import hudson.Extension;
 import hudson.FilePath;
-import hudson.Main;
+import hudson.Functions;
 import hudson.XmlFile;
 import hudson.console.AnnotatedLargeText;
 import hudson.console.LineTransformationOutputStream;
-import hudson.model.Computer;
+import hudson.console.ModelHyperlinkNote;
 import hudson.model.Executor;
 import hudson.model.Item;
+import hudson.model.ParameterValue;
+import hudson.model.ParametersAction;
 import hudson.model.Queue;
 import hudson.model.Result;
 import hudson.model.Run;
 import hudson.model.StreamBuildListener;
 import hudson.model.TaskListener;
+import hudson.model.User;
 import hudson.model.listeners.RunListener;
 import hudson.model.listeners.SCMListener;
 import hudson.scm.ChangeLogSet;
 import hudson.scm.SCM;
 import hudson.scm.SCMRevisionState;
+import hudson.security.ACL;
+import hudson.slaves.NodeProperty;
+import hudson.util.DaemonThreadFactory;
 import hudson.util.Iterators;
+import hudson.util.NamingThreadFactory;
 import hudson.util.NullStream;
 import hudson.util.PersistedList;
 import java.io.File;
@@ -62,13 +71,20 @@ import java.io.OutputStream;
 import java.io.PrintStream;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -76,19 +92,24 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.CheckForNull;
 import javax.annotation.Nonnull;
-import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
+import jenkins.model.CauseOfInterruption;
 import jenkins.model.Jenkins;
 import jenkins.model.lazy.BuildReference;
 import jenkins.model.lazy.LazyBuildMixIn;
 import jenkins.model.queue.AsynchronousExecution;
+import jenkins.scm.RunWithSCM;
+import jenkins.security.NotReallyRoleSensitiveCallable;
 import jenkins.util.Timer;
+import org.acegisecurity.Authentication;
+import org.jenkinsci.plugins.workflow.FilePathUtils;
 import org.jenkinsci.plugins.workflow.actions.LogAction;
 import org.jenkinsci.plugins.workflow.actions.ThreadNameAction;
 import org.jenkinsci.plugins.workflow.actions.TimingAction;
 import org.jenkinsci.plugins.workflow.flow.FlowDefinition;
 import org.jenkinsci.plugins.workflow.flow.FlowExecution;
 import org.jenkinsci.plugins.workflow.flow.FlowExecutionList;
+import org.jenkinsci.plugins.workflow.flow.FlowExecutionListener;
 import org.jenkinsci.plugins.workflow.flow.FlowExecutionOwner;
 import org.jenkinsci.plugins.workflow.flow.GraphListener;
 import org.jenkinsci.plugins.workflow.flow.StashManager;
@@ -101,6 +122,8 @@ import org.jenkinsci.plugins.workflow.steps.StepContext;
 import org.jenkinsci.plugins.workflow.steps.StepExecution;
 import org.jenkinsci.plugins.workflow.support.concurrent.Futures;
 import org.jenkinsci.plugins.workflow.support.steps.input.POSTHyperlinkNote;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.DoNotUse;
 import org.kohsuke.stapler.HttpResponse;
 import org.kohsuke.stapler.HttpResponses;
 import org.kohsuke.stapler.export.Exported;
@@ -108,12 +131,20 @@ import org.kohsuke.stapler.interceptor.RequirePOST;
 
 @SuppressWarnings("SynchronizeOnNonFinalField")
 @SuppressFBWarnings(value="JLM_JSR166_UTILCONCURRENT_MONITORENTER", justification="completed is an unusual usage")
-public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements FlowExecutionOwner.Executable, LazyBuildMixIn.LazyLoadingRun<WorkflowJob,WorkflowRun> {
+public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements FlowExecutionOwner.Executable, LazyBuildMixIn.LazyLoadingRun<WorkflowJob,WorkflowRun>, RunWithSCM<WorkflowJob,WorkflowRun> {
 
     private static final Logger LOGGER = Logger.getLogger(WorkflowRun.class.getName());
 
-    /** null until started */
-    private @Nullable FlowExecution execution;
+    private enum StopState {
+        TERM, KILL;
+
+        public String url() {
+            return this.name().toLowerCase(Locale.ENGLISH);
+        }
+    }
+
+    /** null until started, or after serious failures or hard kill */
+    private @CheckForNull FlowExecution execution;
 
     /**
      * {@link Future} that yields {@link #execution}, when it is fully configured and ready to be exposed.
@@ -126,6 +157,23 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         }
     };
     private transient StreamBuildListener listener;
+
+    private transient boolean allowTerm;
+
+    private transient boolean allowKill;
+
+    /**
+     * Cumulative list of people who contributed to the build problem.
+     *
+     * <p>
+     * This is a list of {@link User#getId() user ids} who made a change
+     * since the last non-broken build. Can be null (which should be
+     * treated like empty set), because of the compatibility.
+     *
+     * <p>
+     * This field is semi-final --- once set the value will never be modified.
+     */
+    private volatile Set<String> culprits;
 
     /**
      * Flag for whether or not the build has completed somehow.
@@ -152,7 +200,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
     public WorkflowRun(WorkflowJob job) throws IOException {
         super(job);
         firstTime = true;
-        checkouts = new PersistedList<SCMCheckout>(this);
+        checkouts = new PersistedList<>(this);
         //System.err.printf("created %s @%h%n", this, this);
     }
 
@@ -195,6 +243,14 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
             OutputStream logger = new FileOutputStream(getLogFile());
             listener = new StreamBuildListener(logger, Charset.defaultCharset());
             listener.started(getCauses());
+            Authentication auth = Jenkins.getAuthentication();
+            if (!auth.equals(ACL.SYSTEM)) {
+                String name = auth.getName();
+                if (!auth.equals(Jenkins.ANONYMOUS)) {
+                    name = ModelHyperlinkNote.encodeTo(User.get(name));
+                }
+                listener.getLogger().println(hudson.model.Messages.Run_running_as_(name));
+            }
             RunListener.fireStarted(this, listener);
             updateSymlinks(listener);
             FlowDefinition definition = getParent().getDefinition();
@@ -207,19 +263,34 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
             FlowExecutionList.get().register(owner);
             newExecution.addListener(new GraphL());
             completed = new AtomicBoolean();
-            logsToCopy = new ConcurrentSkipListMap<String,Long>();
+            logsToCopy = new ConcurrentSkipListMap<>();
             execution = newExecution;
             newExecution.start();
             executionPromise.set(newExecution);
+            FlowExecutionListener.fireRunning(execution);
+
         } catch (Throwable x) {
             execution = null; // ensures isInProgress returns false
             finish(Result.FAILURE, x);
-            executionPromise.setException(x);
+            try {
+                executionPromise.setException(x);
+            } catch (Error e) {
+                if (e != x) { // cf. CpsThread.runNextChunk
+                    throw e;
+                }
+            }
             return;
         }
         throw sleep();
     }
 
+    private static ScheduledExecutorService copyLogsExecutorService;
+    private static synchronized ScheduledExecutorService copyLogsExecutorService() {
+        if (copyLogsExecutorService == null) {
+            copyLogsExecutorService = new /*ErrorLogging*/ScheduledThreadPoolExecutor(5, new NamingThreadFactory(new DaemonThreadFactory(), "WorkflowRun.copyLogs"));
+        }
+        return copyLogsExecutorService;
+    }
     private AsynchronousExecution sleep() {
         final AsynchronousExecution asynchronousExecution = new AsynchronousExecution() {
             @Override public void interrupt(boolean forShutdown) {
@@ -228,26 +299,34 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
                 }
                 Timer.get().submit(new Runnable() {
                     @Override public void run() {
+                        if (execution == null) {
+                            return;
+                        }
                         Executor executor = getExecutor();
+                        if (executor == null) {
+                            LOGGER.log(Level.WARNING, "Lost executor for {0}", WorkflowRun.this);
+                            return;
+                        }
                         try {
-                            execution.interrupt(executor.abortResult());
+                            Collection<CauseOfInterruption> causes = executor.getCausesOfInterruption();
+                            execution.interrupt(executor.abortResult(), causes.toArray(new CauseOfInterruption[causes.size()]));
                         } catch (Exception x) {
                             LOGGER.log(Level.WARNING, null, x);
                         }
                         executor.recordCauseOfInterruption(WorkflowRun.this, listener);
-                        printLater("term", "Click here to forcibly terminate running steps");
+                        printLater(StopState.TERM, "Click here to forcibly terminate running steps");
                     }
                 });
             }
             @Override public boolean blocksRestart() {
-                return execution.blocksRestart();
+                return execution != null && execution.blocksRestart();
             }
             @Override public boolean displayCell() {
                 return blocksRestart();
             }
         };
-        final AtomicReference<ScheduledFuture<?>> copyLogsTask = new AtomicReference<ScheduledFuture<?>>();
-        copyLogsTask.set(Timer.get().scheduleAtFixedRate(new Runnable() {
+        final AtomicReference<ScheduledFuture<?>> copyLogsTask = new AtomicReference<>();
+        copyLogsTask.set(copyLogsExecutorService().scheduleAtFixedRate(new Runnable() {
             @Override public void run() {
                 synchronized (completed) {
                     if (completed.get()) {
@@ -263,20 +342,35 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
                         listener = new StreamBuildListener(new NullStream());
                         return;
                     }
-                    copyLogs();
+                    Thread t = Thread.currentThread();
+                    String old = t.getName();
+                    t.setName(old + " (" + WorkflowRun.this + ")");
+                    try {
+                        copyLogs();
+                    } finally {
+                        t.setName(old);
+                    }
                 }
             }
         }, 1, 1, TimeUnit.SECONDS));
         return asynchronousExecution;
     }
 
-    private void printLater(final String url, final String message) {
+    private void printLater(final StopState state, final String message) {
         Timer.get().schedule(new Runnable() {
             @Override public void run() {
                 if (!isInProgress()) {
                     return;
                 }
-                listener.getLogger().println(POSTHyperlinkNote.encodeTo("/" + getUrl() + url, message));
+                switch (state) {
+                    case TERM:
+                        allowTerm = true;
+                        break;
+                    case KILL:
+                        allowKill = true;
+                        break;
+                }
+                listener.getLogger().println(POSTHyperlinkNote.encodeTo("/" + getUrl() + state.url(), message));
             }
         }, 15, TimeUnit.SECONDS);
     }
@@ -285,7 +379,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
     @RequirePOST
     public void doTerm() {
         checkPermission(Item.CANCEL);
-        if (!isInProgress()) {
+        if (!isInProgress() || /* redundant, but make FindBugs happy */ execution == null) {
             return;
         }
         final Throwable x = new FlowInterruptedException(Result.ABORTED);
@@ -306,14 +400,14 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
             }
             @Override public void onFailure(Throwable t) {}
         });
-        printLater("kill", "Click here to forcibly kill entire build");
+        printLater(StopState.KILL, "Click here to forcibly kill entire build");
     }
 
     /** Immediately kills the build. */
     @RequirePOST
     public void doKill() {
         checkPermission(Item.CANCEL);
-        if (!isBuilding()) {
+        if (!isBuilding() || /* probably redundant, but just to be sure */ execution == null) {
             return;
         }
         if (listener != null) {
@@ -326,19 +420,53 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         // TODO CpsFlowExecution.onProgramEnd does some cleanup which we cannot access here; perhaps need a FlowExecution.halt(Throwable) API?
     }
 
+    @Override public EnvVars getEnvironment(TaskListener listener) throws IOException, InterruptedException {
+        EnvVars env = super.getEnvironment(listener);
+
+        Jenkins instance = Jenkins.getInstance();
+        if (instance != null) {
+            for (NodeProperty nodeProperty : instance.getGlobalNodeProperties()) {
+                nodeProperty.buildEnvVars(env, listener);
+            }
+        }
+
+        // TODO EnvironmentContributingAction does not support Job yet:
+        ParametersAction a = getAction(ParametersAction.class);
+        if (a != null) {
+            for (ParameterValue v : a) {
+                v.buildEnvironment(this, env);
+            }
+        }
+        EnvVars.resolve(env);
+        return env;
+    }
+
+    @Restricted(DoNotUse.class) // Jelly
+    public boolean hasAllowTerm() {
+        return isBuilding() && allowTerm;
+    }
+
+    @Restricted(DoNotUse.class) // Jelly
+    public boolean hasAllowKill() {
+        return isBuilding() && allowKill;
+    }
+
     @GuardedBy("completed")
     private void copyLogs() {
         if (logsToCopy == null) { // finished
             return;
         }
         if (logsToCopy instanceof LinkedHashMap) { // upgrade while build is running
-            logsToCopy = new ConcurrentSkipListMap<String,Long>(logsToCopy);
+            logsToCopy = new ConcurrentSkipListMap<>(logsToCopy);
         }
         boolean modified = false;
         for (Map.Entry<String,Long> entry : logsToCopy.entrySet()) {
             String id = entry.getKey();
             FlowNode node;
             try {
+                if (execution == null) {
+                    return; // broken somehow
+                }
                 node = execution.getNode(id);
             } catch (IOException x) {
                 LOGGER.log(Level.WARNING, null, x);
@@ -367,13 +495,13 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
                     }
 
                     try {
-                        long revised = logText.writeRawLogTo(old, logger);
+                        long revised = writeRawLogTo(logText, old, logger);
                         if (revised != old) {
                             logsToCopy.put(id, revised);
                             modified = true;
                         }
                         if (logText.isComplete()) {
-                            logText.writeRawLogTo(revised, logger); // defend against race condition?
+                            writeRawLogTo(logText, revised, logger); // defend against race condition?
                             assert !node.isRunning() : "LargeText.complete yet " + node + " claims to still be running";
                             logsToCopy.remove(id);
                             modified = true;
@@ -401,16 +529,27 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
             }
         }
     }
+    private long writeRawLogTo(AnnotatedLargeText<?> text, long start, OutputStream out) throws IOException {
+        long len = text.length();
+        if (start > len) {
+            LOGGER.log(Level.WARNING, "JENKINS-37664: attempt to copy logs in {0} @{1} past end @{2}", new Object[] {this, start, len});
+            return len;
+        } else {
+            return text.writeRawLogTo(start, out);
+        }
+    }
 
     @GuardedBy("completed")
     private transient LoadingCache<FlowNode,Optional<String>> logPrefixCache;
     private @CheckForNull String getLogPrefix(FlowNode node) {
+        // TODO could also use FlowScanningUtils.fetchEnclosingBlocks(node).filter(FlowScanningUtils.hasActionPredicate(ThreadNameAction.class)),
+        // but this would not let us cache intermediate results
         synchronized (completed) {
             if (logPrefixCache == null) {
                 logPrefixCache = CacheBuilder.newBuilder().weakKeys().build(new CacheLoader<FlowNode,Optional<String>>() {
                     @Override public @Nonnull Optional<String> load(FlowNode node) {
                         if (node instanceof BlockEndNode) {
-                            return Optional.absent();
+                            return Optional.fromNullable(getLogPrefix(((BlockEndNode) node).getStartNode()));
                         }
                         ThreadNameAction threadNameAction = node.getAction(ThreadNameAction.class);
                         if (threadNameAction != null) {
@@ -447,7 +586,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         }
     }
     
-    private static final Map<String,WorkflowRun> LOADING_RUNS = new HashMap<String,WorkflowRun>();
+    private static final Map<String,WorkflowRun> LOADING_RUNS = new HashMap<>();
 
     private String key() {
         return getParent().getFullName() + '/' + getId();
@@ -467,9 +606,6 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         super.onLoad();
         if (completed != null) {
             throw new IllegalStateException("double onLoad of " + this);
-        } else if (Main.isUnitTest) {
-            // TODO JENKINS-22767: prior to 1.646, occasionally load the same build twice
-            System.err.printf("loading %s @%h%n", this, this);
         }
         if (execution != null) {
             try {
@@ -484,10 +620,12 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
             executionPromise.set(execution);
             if (!execution.isComplete()) {
                 // we've been restarted while we were running. let's get the execution going again.
+                FlowExecutionListener.fireResumed(execution);
+
                 try {
                     OutputStream logger = new FileOutputStream(getLogFile(), true);
                     listener = new StreamBuildListener(logger, Charset.defaultCharset());
-                    listener.getLogger().println("Resuming build");
+                    listener.getLogger().println("Resuming build at " + new Date() + " after Jenkins restart");
                 } catch (IOException x) {
                     LOGGER.log(Level.WARNING, null, x);
                     listener = new StreamBuildListener(new NullStream());
@@ -518,8 +656,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
     /** Handles normal build completion (including errors) but also handles the case that the flow did not even start correctly, for example due to an error in {@link FlowExecution#start}. */
     private void finish(@Nonnull Result r, @CheckForNull Throwable t) {
         setResult(r);
-        LOGGER.log(Level.INFO, "{0} completed: {1}", new Object[] {this, getResult()});
-        // TODO set duration
+        LOGGER.log(Level.INFO, "{0} completed: {1}", new Object[] {toString(), getResult()});
         if (listener == null) {
             LOGGER.log(Level.WARNING, this + " failed to start", t);
         } else {
@@ -529,7 +666,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
             } else if (t instanceof FlowInterruptedException) {
                 ((FlowInterruptedException) t).handle(this, listener);
             } else if (t != null) {
-                t.printStackTrace(listener.getLogger());
+                listener.getLogger().println(Functions.printThrowable(t).trim()); // TODO 2.43+ use Functions.printStackTrace
             }
             listener.finished(getResult());
             listener.closeQuietly();
@@ -540,7 +677,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
             save();
             getParent().logRotate();
         } catch (Exception x) {
-            LOGGER.log(Level.WARNING, null, x);
+            LOGGER.log(Level.WARNING, "failed to save " + this + " or perform log rotation", x);
         }
         onEndBuilding();
         if (completed != null) {
@@ -553,6 +690,10 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
             StashManager.maybeClearAll(this);
         } catch (IOException x) {
             LOGGER.log(Level.WARNING, "failed to clean up stashes from " + this, x);
+        }
+        FlowExecution exec = getExecution();
+        if (exec != null) {
+            FlowExecutionListener.fireCompleted(exec);
         }
     }
 
@@ -605,16 +746,17 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
             if (listener != null) {
                 listener.error("JENKINS-26761: list of SCM checkouts in " + this + " was lost; polling will be broken");
             }
-            checkouts = new PersistedList<SCMCheckout>(this);
+            checkouts = new PersistedList<>(this);
             // Could this.save(), but might pollute diagnosis, and (worse) might clobber real data if there is >1 WorkflowRun with the same ID.
         }
         return checkouts;
     }
 
+    @Override
     @Exported
     public synchronized List<ChangeLogSet<? extends ChangeLogSet.Entry>> getChangeSets() {
         if (changeSets == null) {
-            changeSets = new ArrayList<ChangeLogSet<? extends ChangeLogSet.Entry>>();
+            changeSets = new ArrayList<>();
             for (SCMCheckout co : checkouts(null)) {
                 if (co.changelogFile != null && co.changelogFile.isFile()) {
                     try {
@@ -630,6 +772,27 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
             }
         }
         return changeSets;
+    }
+
+    @Override
+    @CheckForNull public Set<String> getCulpritIds() {
+        if (shouldCalculateCulprits()) {
+            HashSet<String> tempCulpritIds = new HashSet<>();
+            for (User u : getCulprits()) {
+                tempCulpritIds.add(u.getId());
+            }
+            if (isBuilding()) {
+                return ImmutableSortedSet.copyOf(tempCulpritIds);
+            } else {
+                culprits = ImmutableSortedSet.copyOf(tempCulpritIds);
+            }
+        }
+        return culprits;
+    }
+
+    @Override
+    public boolean shouldCalculateCulprits() {
+        return isBuilding() || culprits == null;
     }
 
     @RequirePOST
@@ -653,19 +816,14 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
                 l.onChangeLogParsed(this, scm, listener, cls);
             }
         }
-        // TODO JENKINS-26096 prefer a variant returning only Computer.name even if offline
-        Computer computer = workspace.toComputer();
-        if (computer == null) {
-            throw new IllegalStateException();
-        }
-        checkouts(listener).add(new SCMCheckout(scm, computer.getName(), workspace.getRemote(), changelogFile, pollingBaseline));
+        checkouts(listener).add(new SCMCheckout(scm, FilePathUtils.getNodeName(workspace), workspace.getRemote(), changelogFile, pollingBaseline));
     }
 
     static final class SCMCheckout {
         final SCM scm;
         final String node;
         final String workspace;
-        // TODO make this a String and relativize to Run.rootDir if possible
+        // TODO JENKINS-27704 make this a String and relativize to Run.rootDir if possible
         final @CheckForNull File changelogFile;
         final @CheckForNull SCMRevisionState pollingBaseline;
         SCMCheckout(SCM scm, String node, String workspace, File changelogFile, SCMRevisionState pollingBaseline) {
@@ -674,6 +832,13 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
             this.workspace = workspace;
             this.changelogFile = changelogFile;
             this.pollingBaseline = pollingBaseline;
+        }
+        // TODO replace with Run.XSTREAM2.addCriticalField(SCMCheckout.class, "scm") when not @Restricted(NoExternalUse.class)
+        private Object readResolve() {
+            if (scm == null) {
+                throw new IllegalStateException("Unloadable scm field");
+            }
+            return this;
         }
     }
 
@@ -698,11 +863,15 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
                 if (candidate != null && candidate.getParent().getFullName().equals(job) && candidate.getId().equals(id)) {
                     run = candidate;
                 } else {
-                    Jenkins jenkins = Jenkins.getInstance();
+                    final Jenkins jenkins = Jenkins.getInstance();
                     if (jenkins == null) {
                         throw new IOException("Jenkins is not running"); // do not use Jenkins.getActiveInstance() as that is an ISE
                     }
-                    WorkflowJob j = jenkins.getItemByFullName(job, WorkflowJob.class);
+                    WorkflowJob j = ACL.impersonate(ACL.SYSTEM, new NotReallyRoleSensitiveCallable<WorkflowJob,IOException>() {
+                        @Override public WorkflowJob call() throws IOException {
+                            return jenkins.getItemByFullName(job, WorkflowJob.class);
+                        }
+                    });
                     if (j == null) {
                         throw new IOException("no such WorkflowJob " + job);
                     }
@@ -754,6 +923,16 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         @Override public String getUrl() throws IOException {
             return run().getUrl();
         }
+        @Override public TaskListener getListener() throws IOException {
+            StreamBuildListener l = run().listener;
+            if (l != null) {
+                return l;
+            } else {
+                // Seems to happen at least once during resume, but anyway TryRepeatedly will call this method again, rather than caching the result.
+                LOGGER.log(Level.FINE, "No listener yet for {0}", this);
+                return TaskListener.NULL;
+            }
+        }
         @Override public String toString() {
             return "Owner[" + key() + ":" + run + "]";
         }
@@ -784,7 +963,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
 
             logNodeMessage(node);
             if (node instanceof FlowEndNode) {
-                finish(((FlowEndNode) node).getResult(), execution.getCauseOfFailure());
+                finish(((FlowEndNode) node).getResult(), execution != null ? execution.getCauseOfFailure() : null);
             } else {
                 try {
                     save();

@@ -22,8 +22,10 @@
  * THE SOFTWARE.
  */
 
-package org.jenkinsci.plugins.workflow;
+package org.jenkinsci.plugins.workflow.job;
 
+import com.google.common.collect.ImmutableSet;
+import hudson.AbortException;
 import hudson.model.BallColor;
 import hudson.model.Executor;
 import hudson.model.Item;
@@ -43,10 +45,18 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+
+import hudson.slaves.EnvironmentVariablesNodeProperty;
+import hudson.slaves.NodeProperty;
+import hudson.slaves.NodePropertyDescriptor;
+import hudson.util.DescribableList;
+import java.lang.ref.WeakReference;
+import java.util.logging.Level;
 import jenkins.model.CauseOfInterruption;
 import jenkins.model.InterruptedBuildAction;
 import jenkins.model.Jenkins;
 import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.plugins.scriptsecurity.scripts.ScriptApproval;
 import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition;
 import org.jenkinsci.plugins.workflow.cps.CpsFlowExecution;
@@ -54,8 +64,6 @@ import org.jenkinsci.plugins.workflow.cps.nodes.StepNode;
 import org.jenkinsci.plugins.workflow.flow.FlowExecution;
 import org.jenkinsci.plugins.workflow.graph.FlowGraphWalker;
 import org.jenkinsci.plugins.workflow.graph.FlowNode;
-import org.jenkinsci.plugins.workflow.job.WorkflowJob;
-import org.jenkinsci.plugins.workflow.job.WorkflowRun;
 import org.jenkinsci.plugins.workflow.test.steps.SemaphoreStep;
 import static org.junit.Assert.*;
 import org.junit.ClassRule;
@@ -64,6 +72,8 @@ import org.junit.Test;
 import org.jvnet.hudson.test.BuildWatcher;
 import org.jvnet.hudson.test.Issue;
 import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.LoggerRule;
+import org.jvnet.hudson.test.MemoryAssert;
 import org.jvnet.hudson.test.MockAuthorizationStrategy;
 import org.jvnet.hudson.test.recipes.LocalData;
 
@@ -71,32 +81,35 @@ public class WorkflowRunTest {
 
     @ClassRule public static BuildWatcher buildWatcher = new BuildWatcher();
     @Rule public JenkinsRule r = new JenkinsRule();
+    @Rule public LoggerRule logging = new LoggerRule();
 
     @Test public void basics() throws Exception {
         WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "p");
         p.setDefinition(new CpsFlowDefinition("println('hello')"));
         WorkflowRun b1 = r.assertBuildStatusSuccess(p.scheduleBuild2(0));
         assertFalse(b1.isBuilding());
-        // TODO protected (but !building -> !inProgress): assertFalse(b1.isInProgress());
+        assertFalse(b1.isInProgress());
         assertFalse(b1.isLogUpdated());
         assertTrue(b1.getDuration() > 0);
         WorkflowRun b2 = r.assertBuildStatusSuccess(p.scheduleBuild2(0));
         assertEquals(b1, b2.getPreviousBuild());
         assertEquals(null, b1.getPreviousBuild());
-        r.assertLogContains("hello\n", b1);
+        r.assertLogContains("hello", b1);
     }
 
+    @Issue("JENKINS-30910")
     @Test public void parameters() throws Exception {
         WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "p");
         p.setDefinition(new CpsFlowDefinition("echo \"param=${PARAM}\"",true));
         p.addProperty(new ParametersDefinitionProperty(new StringParameterDefinition("PARAM", null)));
-        WorkflowRun b = r.assertBuildStatusSuccess(p.scheduleBuild2(0, new ParametersAction(new StringParameterValue("PARAM", "value"))));
-        r.assertLogContains("param=value", b);
+        r.assertLogContains("param=value", r.assertBuildStatusSuccess(p.scheduleBuild2(0, new ParametersAction(new StringParameterValue("PARAM", "value")))));
+        p.setDefinition(new CpsFlowDefinition("echo \"param=${env.PARAM}\"",true));
+        r.assertLogContains("param=value", r.assertBuildStatusSuccess(p.scheduleBuild2(0, new ParametersAction(new StringParameterValue("PARAM", "value")))));
     }
 
     @Test public void funnyParameters() throws Exception {
         WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "p");
-        p.setDefinition(new CpsFlowDefinition("echo \"a.b=${binding['a.b']}\"", /* TODO Script.binding does not work in sandbox */false));
+        p.setDefinition(new CpsFlowDefinition("echo \"a.b=${params['a.b']}\"", true));
         p.addProperty(new ParametersDefinitionProperty(new StringParameterDefinition("a.b", null)));
         WorkflowRun b = r.assertBuildStatusSuccess(p.scheduleBuild2(0, new ParametersAction(new StringParameterValue("a.b", "v"))));
         r.assertLogContains("a.b=v", b);
@@ -142,6 +155,10 @@ public class WorkflowRunTest {
         assertFalse(b1.hasntStartedYet());
         assertColor(b1, BallColor.BLUE);
 
+        p.makeDisabled(true);
+        assertSame(BallColor.DISABLED, p.getIconColor());
+        p.makeDisabled(false);
+
         // get another one going
         q = p.scheduleBuild2(0);
         WorkflowRun b2 = q.getStartCondition().get();
@@ -150,6 +167,10 @@ public class WorkflowRunTest {
         // initial state should be blinking blue because the last one was blue
         assertFalse(b2.hasntStartedYet());
         assertColor(b2, BallColor.BLUE_ANIME);
+
+        p.makeDisabled(true);
+        assertSame(BallColor.DISABLED_ANIME, p.getIconColor());
+        p.makeDisabled(false);
 
         SemaphoreStep.waitForStart("wait/2", b2);
 
@@ -168,6 +189,18 @@ public class WorkflowRunTest {
     private void assertColor(WorkflowRun b, BallColor color) throws IOException {
         assertSame(color, b.getIconColor());
         assertSame(color, b.getParent().getIconColor());
+    }
+
+    @Test public void cleanup() throws Exception {
+        logging.record("", Level.INFO).capture(256); // like WebAppMain would do, if in a real instance rather than JenkinsRule
+        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "p");
+        p.setDefinition(new CpsFlowDefinition("", true));
+        WorkflowRun b1 = r.buildAndAssertSuccess(p);
+        WeakReference<WorkflowRun> b1r = new WeakReference<>(b1);
+        b1.delete();
+        b1 = null;
+        r.jenkins.getQueue().clearLeftItems(); // so we do not need to wait 5m
+        MemoryAssert.assertGC(b1r, false);
     }
 
     @Test public void scriptApproval() throws Exception {
@@ -242,7 +275,7 @@ public class WorkflowRunTest {
             FlowExecution exec = b.getExecution();
             assertNotNull(exec);
             FlowGraphWalker w = new FlowGraphWalker(exec);
-            List<String> steps = new ArrayList<String>();
+            List<String> steps = new ArrayList<>();
             for (FlowNode n : w) {
                 if (n instanceof StepNode) {
                     steps.add(((StepNode) n).getDescriptor().getFunctionName());
@@ -272,8 +305,126 @@ public class WorkflowRunTest {
         ex.interrupt();
         r.assertBuildStatus(Result.ABORTED, r.waitForCompletion(b2));
         iba = b2.getAction(InterruptedBuildAction.class);
-        assertNotNull(iba);
-        assertEquals(Collections.emptyList(), iba.getCauses());
+        assertNull(iba);
     }
 
+    @Issue("JENKINS-41276")
+    @Test public void interruptCause() throws Exception {
+        r.jenkins.setSecurityRealm(r.createDummySecurityRealm());
+        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "p");
+        ScriptApproval.get().approveSignature("method org.jenkinsci.plugins.workflow.steps.FlowInterruptedException getCauses"); // TODO should probably be @Whitelisted
+        ScriptApproval.get().approveSignature("method jenkins.model.CauseOfInterruption$UserInterruption getUser"); // ditto
+        p.setDefinition(new CpsFlowDefinition("@NonCPS def users(e) {e.causes*.user}; try {semaphore 'wait'} catch (e) {echo(/users=${users(e)}/); throw e}", true));
+        final WorkflowRun b1 = p.scheduleBuild2(0).waitForStart();
+        SemaphoreStep.waitForStart("wait/1", b1);
+        ACL.impersonate(User.get("dev").impersonate(), new Runnable() {
+            @Override public void run() {
+                b1.getExecutor().doStop();
+            }
+        });
+        r.assertBuildStatus(Result.ABORTED, r.waitForCompletion(b1));
+        r.assertLogContains("users=[dev]", b1);
+        InterruptedBuildAction iba = b1.getAction(InterruptedBuildAction.class);
+        assertNotNull(iba);
+        assertEquals(Collections.singletonList(new CauseOfInterruption.UserInterruption("dev")), iba.getCauses());
+        String log = JenkinsRule.getLog(b1);
+        assertEquals(log, 1, StringUtils.countMatches(log, jenkins.model.Messages.CauseOfInterruption_ShortDescription("dev")));
+    }
+
+    @Test
+    @Issue({"JENKINS-26122", "JENKINS-28222"})
+    public void parallelBranchLabels() throws Exception {
+        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "p");
+        p.setDefinition(new CpsFlowDefinition(
+            "parallel a: {\n" +
+            "  echo 'a-outside-1'\n" +
+            "  withEnv(['A=1']) {echo 'a-inside-1'}\n" +
+            "  echo 'a-outside-2'\n" +
+            "  withEnv(['A=1']) {echo 'a-inside-2'}\n" +
+            "}, b: {\n" +
+            "  echo 'b-outside-1'\n" +
+            "  withEnv(['B=1']) {echo 'b-inside-1'}\n" +
+            "  echo 'b-outside-2'\n" +
+            "  withEnv(['B=1']) {echo 'b-inside-2'}\n" +
+            "}", true));
+        WorkflowRun b = r.assertBuildStatusSuccess(p.scheduleBuild2(0));
+        r.assertLogContains("[a] a-outside-1", b);
+        r.assertLogContains("[b] b-outside-1", b);
+        r.assertLogContains("[a] a-inside-1", b);
+        r.assertLogContains("[b] b-inside-1", b);
+        r.assertLogContains("[a] a-outside-2", b);
+        r.assertLogContains("[b] b-outside-2", b);
+        r.assertLogContains("[a] a-inside-2", b);
+        r.assertLogContains("[b] b-inside-2", b);
+    }
+
+    @Test
+    @Issue("JENKINS-43396")
+    public void globalNodePropertiesInEnv() throws Exception {
+        DescribableList<NodeProperty<?>, NodePropertyDescriptor> original = r.jenkins.getGlobalNodeProperties();
+        EnvironmentVariablesNodeProperty envProp = new EnvironmentVariablesNodeProperty(
+                new EnvironmentVariablesNodeProperty.Entry("KEY", "VALUE"));
+
+        original.add(envProp);
+
+        WorkflowJob j = r.jenkins.createProject(WorkflowJob.class, "envVars");
+        j.setDefinition(new CpsFlowDefinition("echo \"KEY is ${env.KEY}\"", true));
+
+        WorkflowRun b = r.assertBuildStatusSuccess(j.scheduleBuild2(0));
+        r.assertLogContains("KEY is " + envProp.getEnvVars().get("KEY"), b);
+    }
+
+    @Test
+    @Issue("JENKINS-24141")
+    public void culprits() throws Exception {
+        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "p");
+        p.setDefinition(new CpsFlowDefinition("import org.jvnet.hudson.test.FakeChangeLogSCM\n" +
+                "semaphore 'waitFirst'\n" +
+                "def testScm = new FakeChangeLogSCM()\n" +
+                "testScm.addChange().withAuthor(/alice$BUILD_NUMBER/)\n" +
+                "node {\n" +
+                "    checkout(testScm)\n" +
+                "    semaphore 'waitSecond'\n" +
+                "    def secondScm = new FakeChangeLogSCM()\n" +
+                "    secondScm.addChange().withAuthor(/bob$BUILD_NUMBER/)\n" +
+                "    checkout(secondScm)\n" +
+                "    semaphore 'waitThird'\n" +
+                "    def thirdScm = new FakeChangeLogSCM()\n" +
+                "    thirdScm.addChange().withAuthor(/charlie$BUILD_NUMBER/)\n" +
+                "    checkout(thirdScm)\n" +
+                "}\n", false));
+
+        WorkflowRun b1 = p.scheduleBuild2(0).waitForStart();
+
+        SemaphoreStep.waitForStart("waitFirst/1", b1);
+        assertTrue(b1.getCulpritIds().isEmpty());
+        SemaphoreStep.success("waitFirst/1", null);
+
+        SemaphoreStep.waitForStart("waitSecond/1", b1);
+        assertEquals(ImmutableSet.of("alice1"), b1.getCulpritIds());
+        SemaphoreStep.success("waitSecond/1", null);
+
+        SemaphoreStep.waitForStart("waitThird/1", b1);
+        assertEquals(ImmutableSet.of("alice1", "bob1"), b1.getCulpritIds());
+        SemaphoreStep.failure("waitThird/1", new AbortException());
+
+        r.assertBuildStatus(Result.FAILURE, r.waitForCompletion(b1));
+
+        WorkflowRun b2 = p.scheduleBuild2(0).waitForStart();
+
+        SemaphoreStep.waitForStart("waitFirst/2", b2);
+        assertEquals(ImmutableSet.of("alice1", "bob1"), b2.getCulpritIds());
+        SemaphoreStep.success("waitFirst/2", null);
+
+        SemaphoreStep.waitForStart("waitSecond/2", b2);
+        assertEquals(ImmutableSet.of("alice1", "bob1", "alice2"), b2.getCulpritIds());
+        SemaphoreStep.success("waitSecond/2", null);
+
+        SemaphoreStep.waitForStart("waitThird/2", b2);
+        assertEquals(ImmutableSet.of("alice1", "bob1", "alice2", "bob2"), b2.getCulpritIds());
+        SemaphoreStep.success("waitThird/2", b2);
+
+        r.assertBuildStatusSuccess(r.waitForCompletion(b2));
+        assertEquals(ImmutableSet.of("alice1", "bob1", "alice2", "bob2", "charlie2"), b2.getCulpritIds());
+    }
 }
